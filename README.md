@@ -1,4 +1,4 @@
-# 🧍 3D Pose Detector - MediaPipe & CustomTkinter
+# 3D Pose Detector - MediaPipe & CustomTkinter
 
 A sleek, high-performance desktop application for real-time 2D and 3D human pose detection. Powered by **Google MediaPipe** and built with a modern, dark-themed **CustomTkinter** interface, this tool allows you to analyze human movement from both live webcams and pre-recorded video files. 
 
@@ -6,7 +6,7 @@ It features an innovative **Dual-View System** that projects raw 2D skeletal tra
 
 ---
 
-## ✨ Features
+## Features
 
 - **Dual Input Modes:** Instantly toggle between analyzing a local Video File or a Live Webcam feed.
 - **Accurate 3D Spatial Mapping:** Extracts true physical 3D world landmarks (in meters) to guarantee the 3D model maintains accurate human proportions regardless of camera aspect ratio or viewing angle.
@@ -18,7 +18,7 @@ It features an innovative **Dual-View System** that projects raw 2D skeletal tra
 
 ---
 
-## 📸 Screenshots
+## Screenshots
 
 ### 3D Side-by-Side Tracking
 Watch the 3D skeleton mirror exact human movements in real-time, right alongside the original video.
@@ -51,7 +51,7 @@ A pulsing neon skeleton entertains you while your webcam hardware initializes.
 
 ---
 
-## 🚀 How to Run
+## How to Run
 
 ### 1. Prerequisites
 Ensure you have Python 3.9+ installed.
