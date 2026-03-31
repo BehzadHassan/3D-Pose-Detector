@@ -5,6 +5,7 @@ Uses CustomTkinter for a modern dark-themed desktop UI.
 
 import threading
 import time
+import os
 import tkinter as tk
 from tkinter import filedialog
 from typing import Optional
@@ -14,7 +15,7 @@ import cv2
 import numpy as np
 from PIL import Image, ImageTk
 
-from pose_detector import PoseDetector
+from detectors import PoseDetector, HandDetector
 from video_source import VideoSource
 from model_3d import Model3DRenderer
 
@@ -64,8 +65,9 @@ class PoseApp(ctk.CTk):
         self._anim_job   = None               # webcam idle animation after-id
         self._anim_phase = 0                  # animation tick counter
         self._full_path: Optional[str] = None
+        self._sys_var     = ctk.StringVar(value="body")
         self._active_tab  = "video"           # "video" or "3d"
-        self._renderer    = Model3DRenderer()
+        self._renderer    = Model3DRenderer(mode="body")
         self._yaw_var     = tk.DoubleVar(value=0.0)
         self._pitch_var   = tk.DoubleVar(value=15.0)
         self._zoom_var    = tk.DoubleVar(value=1.0)
@@ -75,6 +77,8 @@ class PoseApp(ctk.CTk):
         self._drag_yaw0  = 0.0
         self._drag_pitch0 = 0.0
         self._latest_landmarks_3d: list = []  # latest 3D landmarks for 3D tab
+        self._ui_update_pending = False       # Flag to throttle UI updates
+        self._ui_lock = threading.Lock()
 
         # ── Layout ─────────────────────────────────────────────────────────
         self.grid_columnconfigure(1, weight=1)
@@ -109,160 +113,129 @@ class PoseApp(ctk.CTk):
         sb = ctk.CTkFrame(self, width=270, corner_radius=0, fg_color=BG_SIDEBAR)
         sb.grid(row=0, column=0, sticky="nsew", padx=0, pady=0)
         sb.grid_propagate(False)
-        sb.grid_rowconfigure(20, weight=1)   # spacer
+        sb.grid_rowconfigure(1, weight=1)   # middle scrollable area expands
 
         pad = {"padx": 18, "pady": 6}
 
-        # ── Logo ────────────────────────────────────────────────────────
+        # ── 1. Top Section (Fixed Header) ────────────────────────────────
+        hdr = ctk.CTkFrame(sb, fg_color="transparent")
+        hdr.grid(row=0, column=0, sticky="ew")
+
         logo_lbl = ctk.CTkLabel(
-            sb, text="🦾  Pose Detector",
+            hdr, text="🦾  Pose Detector",
             font=ctk.CTkFont(size=22, weight="bold"),
             text_color=ACCENT,
         )
         logo_lbl.grid(row=0, column=0, sticky="w", padx=18, pady=(24, 4))
 
         sub_lbl = ctk.CTkLabel(
-            sb, text="Powered by Google MediaPipe",
+            hdr, text="Powered by Google MediaPipe",
             font=ctk.CTkFont(size=11),
             text_color=TEXT_MUTED,
         )
         sub_lbl.grid(row=1, column=0, sticky="w", **pad)
 
-        _sep(sb, row=2)
+        # ── 2. Middle Section (Scrollable Settings) ──────────────────────
+        self._sb_scroll = ctk.CTkScrollableFrame(sb, fg_color="transparent", corner_radius=0)
+        self._sb_scroll.grid(row=1, column=0, sticky="nsew", padx=2, pady=5)
+        self._sb_scroll.grid_columnconfigure(0, weight=1)
 
-        # ── Mode selector ────────────────────────────────────────────────
-        ctk.CTkLabel(sb, text="INPUT SOURCE", font=ctk.CTkFont(size=11, weight="bold"),
-                     text_color=TEXT_MUTED).grid(row=3, column=0, sticky="w", **pad)
+        # Settings
+        ctk.CTkLabel(self._sb_scroll, text="SYSTEM TYPE", font=ctk.CTkFont(size=11, weight="bold"),
+                     text_color=TEXT_MUTED).grid(row=0, column=0, sticky="w", padx=14, pady=(4, 2))
+        
+        self._sys_menu = ctk.CTkSegmentedButton(
+            self._sb_scroll, values=["🧍 Body", "✋ Hand"],
+            command=self._on_system_change,
+            selected_color=ACCENT, selected_hover_color="#00B060",
+            unselected_color="#21262D", unselected_hover_color="#30363D",
+        )
+        self._sys_menu.set("🧍 Body")
+        self._sys_menu.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 10))
+
+        # Input Source
+        ctk.CTkLabel(self._sb_scroll, text="INPUT SOURCE", font=ctk.CTkFont(size=11, weight="bold"),
+                     text_color=TEXT_MUTED).grid(row=2, column=0, sticky="w", padx=14, pady=(10, 2))
 
         self._mode_var = ctk.StringVar(value="video")
-
         self._rb_video = ctk.CTkRadioButton(
-            sb, text="📂  Video File", variable=self._mode_var,
-            value="video", font=ctk.CTkFont(size=14),
-            command=self._on_mode_change,
-            fg_color=ACCENT, hover_color="#00B060",
+            self._sb_scroll, text="📂  Video File", variable=self._mode_var,
+            value="video", font=ctk.CTkFont(size=13),
+            command=self._on_mode_change, fg_color=ACCENT,
         )
-        self._rb_video.grid(row=4, column=0, sticky="w", **pad)
+        self._rb_video.grid(row=3, column=0, sticky="w", padx=14, pady=4)
 
         self._rb_cam = ctk.CTkRadioButton(
-            sb, text="📷  Live Webcam", variable=self._mode_var,
-            value="webcam", font=ctk.CTkFont(size=14),
-            command=self._on_mode_change,
-            fg_color=ACCENT, hover_color="#00B060",
+            self._sb_scroll, text="📷  Live Webcam", variable=self._mode_var,
+            value="webcam", font=ctk.CTkFont(size=13),
+            command=self._on_mode_change, fg_color=ACCENT,
         )
-        self._rb_cam.grid(row=5, column=0, sticky="w", **pad)
+        self._rb_cam.grid(row=4, column=0, sticky="w", padx=14, pady=4)
 
-        _sep(sb, row=6)
-
-        # ── Video file section ───────────────────────────────────────────
-        self._video_frame = ctk.CTkFrame(sb, fg_color="transparent")
-        self._video_frame.grid(row=7, column=0, sticky="ew", padx=14, pady=4)
-
-        ctk.CTkLabel(self._video_frame, text="VIDEO FILE",
-                     font=ctk.CTkFont(size=11, weight="bold"),
-                     text_color=TEXT_MUTED).pack(anchor="w", pady=(0, 4))
-
+        # Video/Cam Dynamic Containers
+        self._video_frame = ctk.CTkFrame(self._sb_scroll, fg_color="#1C2128", corner_radius=8)
+        self._video_frame.grid(row=5, column=0, sticky="ew", padx=12, pady=10)
+        
         self._file_path_var = ctk.StringVar(value="No file selected")
-        self._file_label = ctk.CTkLabel(
-            self._video_frame, textvariable=self._file_path_var,
-            text_color=TEXT_MUTED, font=ctk.CTkFont(size=11),
-            wraplength=220, justify="left",
-        )
-        self._file_label.pack(anchor="w", pady=(0, 6))
+        ctk.CTkLabel(self._video_frame, textvariable=self._file_path_var,
+                     text_color=TEXT_MUTED, font=ctk.CTkFont(size=10),
+                     wraplength=190).pack(padx=10, pady=(10, 5))
+        
+        self._browse_btn = ctk.CTkButton(self._video_frame, text="Browse...", height=28,
+                                         font=ctk.CTkFont(size=12), fg_color="#21262D",
+                                         border_color=ACCENT, border_width=1,
+                                         command=self._browse_file)
+        self._browse_btn.pack(fill="x", padx=10, pady=(0, 10))
 
-        self._browse_btn = ctk.CTkButton(
-            self._video_frame, text="Browse…", height=32,
-            font=ctk.CTkFont(size=13),
-            fg_color=BG_PANEL, hover_color="#21262D",
-            border_color=ACCENT, border_width=1,
-            command=self._browse_file,
-        )
-        self._browse_btn.pack(fill="x")
-
-        # ── Webcam section ───────────────────────────────────────────────
-        self._cam_frame = ctk.CTkFrame(sb, fg_color="transparent")
-        self._cam_frame.grid(row=8, column=0, sticky="ew", padx=14, pady=4)
-
-        ctk.CTkLabel(self._cam_frame, text="CAMERA DEVICE",
-                     font=ctk.CTkFont(size=11, weight="bold"),
-                     text_color=TEXT_MUTED).pack(anchor="w", pady=(0, 4))
-
+        self._cam_frame = ctk.CTkFrame(self._sb_scroll, fg_color="#1C2128", corner_radius=8)
+        self._cam_frame.grid(row=6, column=0, sticky="ew", padx=12, pady=10)
+        
         self._cam_var = ctk.StringVar(value="Camera 0 (Default)")
-        self._cam_menu = ctk.CTkOptionMenu(
-            self._cam_frame,
-            values=["Camera 0 (Default)", "Camera 1", "Camera 2", "Camera 3"],
-            variable=self._cam_var,
-            height=32,
-            fg_color=BG_PANEL, button_color=ACCENT,
-            button_hover_color="#00B060",
-        )
-        self._cam_menu.pack(fill="x")
+        self._cam_menu = ctk.CTkOptionMenu(self._cam_frame, values=["Camera 0 (Default)", "Camera 1", "Camera 2"],
+                                           variable=self._cam_var, height=30,
+                                           fg_color="#21262D", button_color=ACCENT)
+        self._cam_menu.pack(fill="x", padx=10, pady=10)
 
-        _sep(sb, row=9)
-
-        # ── Detection settings ───────────────────────────────────────────
-        ctk.CTkLabel(sb, text="DETECTION SETTINGS",
-                     font=ctk.CTkFont(size=11, weight="bold"),
-                     text_color=TEXT_MUTED).grid(row=10, column=0, sticky="w", **pad)
-
-        # Detection confidence
-        ctk.CTkLabel(sb, text="Detection Confidence",
-                     font=ctk.CTkFont(size=12),
-                     text_color=TEXT_LIGHT).grid(row=11, column=0, sticky="w", padx=18, pady=(6, 0))
+        # Detection Confidence
+        ctk.CTkLabel(self._sb_scroll, text="DETECTION SETTINGS", font=ctk.CTkFont(size=11, weight="bold"),
+                     text_color=TEXT_MUTED).grid(row=7, column=0, sticky="w", padx=14, pady=(15, 2))
 
         self._det_conf_var = ctk.DoubleVar(value=0.5)
-        self._det_conf_label = ctk.CTkLabel(sb, text="0.50", text_color=ACCENT,
-                                            font=ctk.CTkFont(size=12))
-        self._det_conf_label.grid(row=12, column=0, sticky="e", padx=18)
-
-        self._det_slider = ctk.CTkSlider(
-            sb, from_=0.1, to=1.0, variable=self._det_conf_var,
-            command=self._on_det_slider,
-            progress_color=ACCENT, button_color=ACCENT,
-        )
-        self._det_slider.grid(row=13, column=0, sticky="ew", padx=18, pady=(0, 6))
-
-        # Tracking confidence
-        ctk.CTkLabel(sb, text="Tracking Confidence",
-                     font=ctk.CTkFont(size=12),
-                     text_color=TEXT_LIGHT).grid(row=14, column=0, sticky="w", padx=18, pady=(4, 0))
+        ctk.CTkLabel(self._sb_scroll, text="Detection Confidence", font=ctk.CTkFont(size=12)).grid(row=8, column=0, sticky="w", padx=14)
+        self._det_conf_label = ctk.CTkLabel(self._sb_scroll, text="0.50", text_color=ACCENT, font=ctk.CTkFont(size=11))
+        self._det_conf_label.grid(row=8, column=0, sticky="e", padx=14)
+        self._det_slider = ctk.CTkSlider(self._sb_scroll, from_=0.1, to=1.0, variable=self._det_conf_var,
+                      command=self._on_det_slider, progress_color=ACCENT, button_color=ACCENT)
+        self._det_slider.grid(row=9, column=0, sticky="ew", padx=14, pady=(0, 10))
 
         self._trk_conf_var = ctk.DoubleVar(value=0.5)
-        self._trk_conf_label = ctk.CTkLabel(sb, text="0.50", text_color=ACCENT,
-                                            font=ctk.CTkFont(size=12))
-        self._trk_conf_label.grid(row=15, column=0, sticky="e", padx=18)
+        ctk.CTkLabel(self._sb_scroll, text="Tracking Confidence", font=ctk.CTkFont(size=12)).grid(row=10, column=0, sticky="w", padx=14)
+        self._trk_conf_label = ctk.CTkLabel(self._sb_scroll, text="0.50", text_color=ACCENT, font=ctk.CTkFont(size=11))
+        self._trk_conf_label.grid(row=10, column=0, sticky="e", padx=14)
+        self._trk_slider = ctk.CTkSlider(self._sb_scroll, from_=0.1, to=1.0, variable=self._trk_conf_var,
+                      command=self._on_trk_slider, progress_color=ACCENT, button_color=ACCENT)
+        self._trk_slider.grid(row=11, column=0, sticky="ew", padx=14, pady=(0, 15))
 
-        self._trk_slider = ctk.CTkSlider(
-            sb, from_=0.1, to=1.0, variable=self._trk_conf_var,
-            command=self._on_trk_slider,
-            progress_color=ACCENT, button_color=ACCENT,
-        )
-        self._trk_slider.grid(row=16, column=0, sticky="ew", padx=18, pady=(0, 6))
+        # ── 3. Bottom Section (Fixed Footer) ──────────────────────────────────
+        ftr = ctk.CTkFrame(sb, fg_color="transparent")
+        ftr.grid(row=2, column=0, sticky="ew")
 
-        _sep(sb, row=17)
-
-        # ── Start / Stop button ──────────────────────────────────────────
         self._start_btn = ctk.CTkButton(
-            sb, text="▶   Start Detection",
-            height=44, font=ctk.CTkFont(size=15, weight="bold"),
+            ftr, text="▶   Start Detection",
+            height=48, font=ctk.CTkFont(size=15, weight="bold"),
             fg_color=ACCENT, hover_color="#00B060",
             text_color="#000000",
             command=self._toggle_detection,
         )
-        self._start_btn.grid(row=18, column=0, sticky="ew", padx=18, pady=(8, 4))
+        self._start_btn.pack(fill="x", padx=18, pady=(10, 10))
 
-        # ── Info card ────────────────────────────────────────────────────
-        info = ctk.CTkFrame(sb, fg_color=BG_PANEL, corner_radius=10)
-        info.grid(row=19, column=0, sticky="ew", padx=18, pady=(8, 18))
+        info = ctk.CTkFrame(ftr, fg_color=BG_PANEL, corner_radius=10)
+        info.pack(fill="x", padx=18, pady=(0, 15))
 
-        self._fps_info   = ctk.CTkLabel(info, text="FPS: —",
-                                        font=ctk.CTkFont(size=13, weight="bold"),
-                                        text_color=ACCENT)
+        self._fps_info = ctk.CTkLabel(info, text="FPS: —", font=ctk.CTkFont(size=13, weight="bold"), text_color=ACCENT)
         self._fps_info.pack(anchor="w", padx=12, pady=(8, 2))
 
-        self._lm_info    = ctk.CTkLabel(info, text="Landmarks: —",
-                                        font=ctk.CTkFont(size=12),
-                                        text_color=TEXT_LIGHT)
+        self._lm_info = ctk.CTkLabel(info, text="Landmarks: —", font=ctk.CTkFont(size=12), text_color=TEXT_LIGHT)
         self._lm_info.pack(anchor="w", padx=12, pady=(0, 8))
 
         # Initial state
@@ -395,6 +368,15 @@ class PoseApp(ctk.CTk):
     #  EVENT HANDLERS
     # ══════════════════════════════════════════════════════════════════════
 
+    def _on_system_change(self, val) -> None:
+        self._sys_var.set("body" if "Body" in val else "hand")
+        if self._running:
+            self._stop_detection()
+        
+        # Update renderer mode immediately
+        self._renderer.mode = self._sys_var.get()
+        self._set_status(f"Switched to {'Hand' if self._sys_var.get()=='hand' else 'Body'} system")
+
     def _on_mode_change(self) -> None:
         # Called during sidebar init before canvas exists – skip visual updates
         if not hasattr(self, "_canvas"):
@@ -517,13 +499,24 @@ class PoseApp(ctk.CTk):
             self.after(0, self._on_source_failed)
             return
 
-        self.after(0, self._update_loading_msg, "Loading pose model…")
+        self.after(0, self._update_loading_msg, f"Loading {self._sys_var.get()} model…")
 
-        det = PoseDetector(
-            min_detection_confidence=self._det_conf_var.get(),
-            min_tracking_confidence=self._trk_conf_var.get(),
-            progress_cb=lambda msg: self.after(0, self._update_loading_msg, msg),
-        )
+        try:
+            if self._sys_var.get() == "hand":
+                det = HandDetector(
+                    det_conf=self._det_conf_var.get(),
+                    trk_conf=self._trk_conf_var.get(),
+                    progress_cb=lambda msg: self.after(0, self._update_loading_msg, msg),
+                )
+            else:
+                det = PoseDetector(
+                    det_conf=self._det_conf_var.get(),
+                    trk_conf=self._trk_conf_var.get(),
+                    progress_cb=lambda msg: self.after(0, self._update_loading_msg, msg),
+                )
+        except Exception as e:
+            self.after(0, self._on_source_failed)
+            return
 
         # Signal the main thread that we're ready
         self.after(0, self._on_source_ready, src, det, badge_text)
@@ -554,7 +547,7 @@ class PoseApp(ctk.CTk):
         else:
             self._show_placeholder()
 
-    def _on_source_ready(self, src: "VideoSource", det: "PoseDetector", badge_text: str) -> None:
+    def _on_source_ready(self, src: "VideoSource", det, badge_text: str) -> None:
         """Called on main thread once source + detector are initialised."""
         self._loading_active = False
         self._source   = src
@@ -684,30 +677,48 @@ class PoseApp(ctk.CTk):
         """Runs in a background thread; pushes frames to the Tk canvas."""
         tick = 0
         while self._running:
-            frame = self._source.get_frame() if self._source else None
+            try:
+                frame = self._source.get_frame() if self._source else None
 
-            if frame is None:
-                # Video file ended or error
-                self.after(0, self._on_stream_ended)
-                break
+                if frame is None:
+                    self.after(0, self._on_stream_ended)
+                    break
 
-            annotated, lm_count, landmarks_3d = self._detector.detect(frame)
+                # Inference
+                annotated, lm_count, landmarks_3d = self._detector.detect(frame)
 
-            # FPS calculation
-            self._frame_count += 1
-            now = time.time()
-            elapsed = now - self._t_last
-            if elapsed >= 0.5:
-                self._fps_display = self._frame_count / elapsed
-                self._frame_count = 0
-                self._t_last = now
+                # FPS calculation
+                self._frame_count += 1
+                now = time.time()
+                elapsed = now - self._t_last
+                if elapsed >= 0.5:
+                    self._fps_display = self._frame_count / elapsed
+                    self._frame_count = 0
+                    self._t_last = now
 
-            tick += 1
-            # Schedule UI update on main thread
-            self.after(0, self._update_canvas, annotated, lm_count, landmarks_3d, tick)
-
-            # Small sleep to be kind to the event loop (≈1 ms)
-            time.sleep(0.001)
+                tick += 1
+                
+                # Performance Optimization:
+                # If we're on the video tab, we can pre-process the frame here
+                # to save work for the main thread.
+                prep_frame = None
+                if self._active_tab == "video":
+                    # We'll do a basic RGB conversion and resize here
+                    # Note: we don't know the canvas size yet, but we can 
+                    # use a standard size or the last known size.
+                    prep_frame = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
+                
+                # Throttled schedule: only send to UI if the last one was processed
+                with self._ui_lock:
+                    if not self._ui_update_pending:
+                        self._ui_update_pending = True
+                        # Schedule UI update on main thread
+                        self.after(0, self._update_canvas, annotated, lm_count, landmarks_3d, tick, prep_frame)
+                
+                # Small sleep to be kind to the CPU
+                time.sleep(0.005)
+            except Exception as e:
+                time.sleep(0.1)
 
     def _on_stream_ended(self) -> None:
         self._set_status("▣  Video finished.  Press ▶ Start to replay.")
@@ -721,47 +732,69 @@ class PoseApp(ctk.CTk):
     # ══════════════════════════════════════════════════════════════════════
 
     def _update_canvas(self, frame: np.ndarray, lm_count: int,
-                       landmarks_3d: list = None, tick: int = 0) -> None:
-        if not self._running:
-            return
-
-        # Store latest 3D landmarks for tab switching
-        if landmarks_3d:
-            self._latest_landmarks_3d = landmarks_3d
-
-        # --- Video tab ---
-        if self._active_tab == "video":
-            cw = self._canvas.winfo_width()
-            ch = self._canvas.winfo_height()
-            if cw < 2 or ch < 2:
+                       landmarks_3d: list = None, tick: int = 0,
+                       prep_rgb: np.ndarray = None) -> None:
+        try:
+            if not self._running:
                 return
 
-            fh, fw = frame.shape[:2]
-            scale = min(cw / fw, ch / fh)
-            nw, nh = int(fw * scale), int(fh * scale)
-            resized = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_LINEAR)
+            # Store latest 3D landmarks for tab switching
+            if landmarks_3d:
+                self._latest_landmarks_3d = landmarks_3d
 
-            rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-            photo = ImageTk.PhotoImage(image=Image.fromarray(rgb))
+            # --- Video tab ---
+            if self._active_tab == "video":
+                cw = self._canvas.winfo_width()
+                ch = self._canvas.winfo_height()
+                if cw < 2 or ch < 2:
+                    return
 
-            x_off = (cw - nw) // 2
-            y_off = (ch - nh) // 2
+                # Use pre-processed frame if available, otherwise process now
+                if prep_rgb is not None:
+                    rgb_src = prep_rgb
+                else:
+                    rgb_src = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-            self._canvas.delete("frame")
-            self._canvas.create_image(x_off, y_off, anchor="nw",
-                                      image=photo, tags="frame")
-            self._last_image_ref = photo
+                fh, fw = rgb_src.shape[:2]
+                scale = min(cw / fw, ch / fh)
+                nw, nh = int(fw * scale), int(fh * scale)
+                
+                # Only resize if needed
+                if nw != fw or nh != fh:
+                    resized = cv2.resize(rgb_src, (nw, nh), interpolation=cv2.INTER_LINEAR)
+                    photo = ImageTk.PhotoImage(image=Image.fromarray(resized))
+                else:
+                    photo = ImageTk.PhotoImage(image=Image.fromarray(rgb_src))
 
-        # --- 3D tab ---
-        elif self._active_tab == "3d" and landmarks_3d:
-            self._render_3d_on_canvas(landmarks_3d, tick)
-            self._render_video_on_3d_canvas(frame)
+                x_off = (cw - nw) // 2
+                y_off = (ch - nh) // 2
 
-        # Update sidebar info
-        self._fps_info.configure(text=f"FPS: {self._fps_display:.1f}")
-        self._lm_info.configure(
-            text=f"Landmarks: {lm_count}" if lm_count else "Landmarks: none"
-        )
+                self._canvas.delete("frame")
+                self._canvas.create_image(x_off, y_off, anchor="nw",
+                                        image=photo, tags="frame")
+                self._last_image_ref = photo
+
+            # --- 3D tab ---
+            elif self._active_tab == "3d":
+                # We always call this so the 'Scanning' animation plays if landmarks_3d is empty
+                self._render_3d_on_canvas(landmarks_3d if landmarks_3d else [], tick)
+                self._render_video_on_3d_canvas(frame)
+
+            # --- Target Lost HUD (Video Tab) ---
+            if not landmarks_3d and self._active_tab == "video":
+                h, w = frame.shape[:2]
+                msg = f"⚠ NO {'HAND' if self._sys_var.get()=='hand' else 'POSE'} DETECTED"
+                cv2.putText(frame, msg, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 80, 255), 2, cv2.LINE_AA)
+                cv2.putText(frame, "Waiting for subject to enter view...", (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 60, 200), 1, cv2.LINE_AA)
+
+            # Update sidebar info
+            self._fps_info.configure(text=f"FPS: {self._fps_display:.1f}")
+            self._lm_info.configure(
+                text=f"Landmarks: {lm_count}" if lm_count else "Landmarks: none"
+            )
+        finally:
+            with self._ui_lock:
+                self._ui_update_pending = False
 
     # ══════════════════════════════════════════════════════════════════════
     #  HELPERS
